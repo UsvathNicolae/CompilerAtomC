@@ -1,0 +1,48 @@
+exprEq: exprEq ( EQUAL | NOTEQ ) exprRel | exprRel
+
+
+
+A: A α1 | … | A αm | β1 | … | βn →  	A: β1 A’ | … | βn A’
+					A’: α1 A’ | … | αm A’ | ε
+
+
+exprEq: exprEq ( EQUAL | NOTEQ ) exprRel | exprRel
+
+exprEq = exprRel exprEqPrim
+exprEqPrim = ( EQUAL | NOTEQ ) exprRel exprEqPrim | epsilon
+
+
+
+exprAdd: exprAdd ( ADD | SUB ) exprMul | exprMul
+
+exprAdd: exprMul exprAddPrim
+exprAddPrim: ( ADD | SUB ) exprMul exprAddPrim | epsilon
+
+
+
+
+exprPostfix: exprPostfix LBRACKET expr RBRACKET | exprPostfix DOT ID | exprPrimary
+
+exprPostfix: exprPrimary exprPostfixPrim
+exprPostfixPrim:LBRACKET expr RBRACKET exprPostfixPrim | DOT ID exprPostfixPrim | epsilon
+
+
+
+exprAnd: exprAnd AND exprEq | exprEq
+=>
+exprAnd: exprEq exprAndPrim
+exprAndPrim: AND exprEq exprAndPrim | epsilon
+
+
+
+exprRel: exprRel ( LESS | LESSEQ | GREATER | GREATEREQ ) exprAdd | exprAdd
+=>
+exprRel: exprAdd exprRelPrim
+exprRelPrim: ( LESS | LESSEQ | GREATER | GREATEREQ ) exprAdd exprRelPrim | epsilon
+
+
+
+exprMul: exprMul ( MUL | DIV ) exprCast | exprCast
+=>
+exprMul: exprCast exprMulPrim
+exprMulPrim: ( MUL | DIV ) exprCast exprMulPrim | epsilon
