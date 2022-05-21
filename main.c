@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include "ad.h"
+#include "at.h"
+#include "at.c"
 
 //ad.c
 Domain *symTable=NULL;
@@ -589,44 +591,65 @@ bool typeBase(Type *t){
     return false;
 }
 
-bool expr();
+bool expr(Ret *r);
 
-bool exprPrimary(){
+bool exprPrimary(Ret *r){
     Token *start=iTk;
     if(consume(ID)) {
+        Token *tkName = consumedTk;
+        Symbol *s=findSymbol(tkName->text);
+        if(!s)tkerr(iTk,"undefined id: %s",tkName->text);
         if (consume(LPAR)) {
-            if (expr()) {
+            if(s->kind!=SK_FN)tkerr(iTk,"only a function can be called");
+            Ret rArg;
+            Symbol *param=s->fn.params;
+            if (expr(&rArg)) {
+                if(!param)tkerr(iTk,"too many arguments in function call");
+                if(!convTo(&rArg.type,&param->type))tkerr(iTk,"in call, cannot convert the argument type to the parameter type");
+                param=param->next;
                 for (;;) {
                     if (consume(COMMA)) {
-                        if (expr()) {}
+                        if (expr(&rArg)) {
+                            if(!param)tkerr(iTk,"too many arguments in function call");
+                            if(!convTo(&rArg.type,&param->type))tkerr(iTk,"in call, cannot convert  the argument type to the parameter type");
+                            param=param->next;
+                        }
                         else break;
                     } else break;
                 }
             }
             if (consume(RPAR)){
+                if(param)tkerr(iTk,"too few arguments in function call");
+                *r=(Ret){s->type,false,true};
                 return true;
             }else{
                 tkerr(iTk,"Lipseste \")\" dupa (");
             }
-
-
-        } else return true;
+        } else{
+            if(s->kind==SK_FN)tkerr(iTk,"a function can only be called");
+            *r=(Ret){s->type,true,s->type.n>=0};
+            return true;
+        }
     }
     iTk = start;
     if(consume(CT_INT)){
+        *r=(Ret){{TB_INT,NULL,-1},false,true};
         return true;
     }
     if(consume(CT_REAL)){
+        *r=(Ret){{TB_DOUBLE,NULL,-1},false,true};
         return true;
     }
     if(consume(CT_CHAR)){
+        *r=(Ret){{TB_CHAR,NULL,-1},false,true};
         return true;
     }
     if(consume(CT_STRING)){
+        *r=(Ret){{TB_CHAR,NULL,0},false,true};
         return true;
     }
     if(consume(LPAR)){
-        if(expr()){
+        if(expr(r)){
             if(consume(RPAR)){
                 return true;
             }else{
@@ -640,11 +663,18 @@ bool exprPrimary(){
 
 
 
-bool exprPostfixPrim(){
+bool exprPostfixPrim(Ret *r){
     if(consume(LBRACKET)){
-        if(expr()){
+        Ret idx;
+        if(expr(&idx)){
             if(consume(RBRACKET)){
-                if(exprPostfixPrim())
+                if(r->type.n<0)tkerr(iTk,"only an array can be indexed");
+                Type tInt={TB_INT,NULL,-1};
+                if(!convTo(&idx.type,&tInt))tkerr(iTk,"the index is not convertible to int");
+                r->type.n=-1;
+                r->lval=true;
+                r->ct=false;
+                if(exprPostfixPrim(r))
                     return true;
             }else{
                 tkerr(iTk,"Lipsete \"]\" dupa [");
@@ -653,17 +683,22 @@ bool exprPostfixPrim(){
     }
     if(consume(DOT)){
         if(consume(ID)) {
-            if (exprPostfixPrim())
+            Token *tkName = consumedTk;
+            if(r->type.tb!=TB_STRUCT)tkerr(iTk,"a field can only be selected from a struct");
+            Symbol *s=findSymbolInList(r->type.s->structMembers,tkName->text);
+            if(!s)tkerr(iTk,"the structure %s does not have a field %s",r->type.s->name,tkName->text);
+            *r=(Ret){s->type,true,s->type.n>=0};
+            if (exprPostfixPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa nume variabila");
     }
     return true;
 }
 
-bool exprPostfix(){
+bool exprPostfix(Ret *r){
     Token *start=iTk;
-    if(exprPrimary())
-        if(exprPostfixPrim())
+    if(exprPrimary(r))
+        if(exprPostfixPrim(r))
             return true;
 
     iTk = start;
@@ -672,35 +707,49 @@ bool exprPostfix(){
 
 bool arrayDecl(Type *t);
 
-bool exprUnary(){
+bool exprUnary(Ret *r){
     Token *start=iTk;
     if(consume(SUB) ) {
-        if (exprUnary()){
+        if (exprUnary(r)){
+            if(!canBeScalar(r))tkerr(iTk,"unary - must have a scalar operand");
+            r->lval=false;
+            r->ct=true;
             return true;
         }else tkerr(iTk,"Lipsa expresie dupa -");
     }
     if( consume(NOT)) {
-        if (exprUnary()){
+        if (exprUnary(r)){
+            if(!canBeScalar(r))tkerr(iTk,"unary - must have a scalar operand");
+            r->lval=false;
+            r->ct=true;
             return true;
         }else tkerr(iTk,"Lipsa expresie dupa !");
 
     }
     iTk = start;
-    if(exprPostfix())
+    if(exprPostfix(r))
             return true;
     iTk = start;
     return false;
 }
 
-bool exprCast(){
+bool exprCast(Ret *r){
     Token *start=iTk;
-    Type t;
+
     if(consume(LPAR)) {
+        Type t;
+        Ret op;
         if (typeBase(&t)) {
             if (arrayDecl(&t) || !arrayDecl(&t)) {
                 if (consume(RPAR)) {
-                    if (exprCast())
+                    if (exprCast(&op)) {
+                        if (t.tb == TB_STRUCT)tkerr(iTk, "cannot convert to a struct type");
+                        if (op.type.tb == TB_STRUCT)tkerr(iTk, "cannot convert a struct");
+                        if (op.type.n >= 0 && t.n < 0)tkerr(iTk, "an array can be converted only to another array");
+                        if (op.type.n < 0 && t.n >= 0)tkerr(iTk, "a scalar can be converted only to another scalar");
+                        *r = (Ret) {t, false, true};
                         return true;
+                    }
                 } else {
                     tkerr(iTk, "Lipseste \")\" dupa (");
                 }
@@ -708,22 +757,30 @@ bool exprCast(){
         }
     }
     iTk = start;
-    if(exprUnary())
+    if(exprUnary(r))
         return true;
     iTk = start;
     return false;
 }
 
-bool exprMulPrim() {
+bool exprMulPrim(Ret *r) {
     if (consume(MUL)) {
-        if (exprCast()) {
-            if (exprMulPrim())
+        Ret right;
+        if (exprCast(&right)) {
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for *");
+            *r=(Ret){tDst,false,true};
+            if (exprMulPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa *");
     }
     if ( consume(DIV)) {
-        if (exprCast()) {
-            if (exprMulPrim())
+        Ret right;
+        if (exprCast(&right)) {
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for /");
+            *r=(Ret){tDst,false,true};
+            if (exprMulPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa /");
     }
@@ -731,25 +788,33 @@ bool exprMulPrim() {
 
 }
 
-bool exprMul(){
+bool exprMul(Ret *r){
     Token *start=iTk;
-    if(exprCast())
-        if(exprMulPrim())
+    if(exprCast(r))
+        if(exprMulPrim(r))
             return true;
     iTk = start;
     return false;
 }
 
-bool exprAddPrim(){
+bool exprAddPrim(Ret *r){
     if(consume(ADD)){
-        if(exprMul()){
-            if(exprAddPrim())
+        Ret right;
+        if(exprMul(&right)){
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for +");
+            *r=(Ret){tDst,false,true};
+            if(exprAddPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa +");
     }
     if( consume(SUB)){
-        if(exprMul()){
-            if(exprAddPrim())
+        Ret right;
+        if(exprMul(&right)){
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for -");
+            *r=(Ret){tDst,false,true};
+            if(exprAddPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa -");
     }
@@ -759,38 +824,54 @@ bool exprAddPrim(){
 
 }
 
-bool exprAdd(){
+bool exprAdd(Ret *r){
     Token *start=iTk;
-    if(exprMul())
-        if(exprAddPrim())
+    if(exprMul(r))
+        if(exprAddPrim(r))
             return true;
     iTk = start;
     return false;
 }
 
-bool exprRelPrim(){
+bool exprRelPrim(Ret *r){
     if(consume(LESS)){
-        if(exprAdd()){
-            if(exprRelPrim())
+        Ret right;
+        if(exprAdd(&right)){
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for <");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if(exprRelPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa <");
 
     }
     if(consume(LESSEQ)){
-        if(exprAdd()){
-            if(exprRelPrim())
+        Ret right;
+        if(exprAdd(&right)){
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for <=");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if(exprRelPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa <=");
     }
     if(consume(GREATER)){
-        if(exprAdd()){
-            if(exprRelPrim())
+        Ret right;
+        if(exprAdd(&right)){
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for >");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if(exprRelPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa >");
     }
     if(consume(GREATEREQ)) {
-        if (exprAdd()) {
-            if (exprRelPrim())
+        Ret right;
+        if (exprAdd(&right)) {
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for >=");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if (exprRelPrim(r))
                 return true;
         } else tkerr(iTk, "Lipsa expresie dupa >=");
     }
@@ -798,44 +879,56 @@ bool exprRelPrim(){
 
 }
 
-bool exprRel(){
+bool exprRel(Ret *r){
     Token *start=iTk;
-    if(exprAdd())
-        if(exprRelPrim())
+    if(exprAdd(r))
+        if(exprRelPrim(r))
             return true;
     iTk = start;
     return false;
 }
 
-bool exprEqPrim(){
+bool exprEqPrim(Ret *r){
     if(consume(EQUAL)){
-        if(exprRel()) {
-            if (exprEqPrim())
+        Ret right;
+        if(exprRel(&right)) {
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for == or !=");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if (exprEqPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa =");
     }
     if( consume(NOTEQ)){
-        if(exprRel()) {
-            if (exprEqPrim())
+        Ret right;
+        if(exprRel(&right)) {
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for == or !=");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if (exprEqPrim(r))
                 return true;
         }else tkerr(iTk,"Lipsa expresie dupa !=");
     }
     return true;
 }
 
-bool exprEq(){
+bool exprEq(Ret *r){
     Token *start=iTk;
-    if(exprRel())
-        if(exprEqPrim())
+    if(exprRel(r))
+        if(exprEqPrim(r))
             return true;
     iTk = start;
     return false;
 }
 
-bool exprAndPrim(){
+bool exprAndPrim(Ret *r){
     if(consume(AND)) {
-        if (exprEq()) {
-            if (exprAndPrim()) {
+        Ret right;
+        if (exprEq(&right)) {
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for &&");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if (exprAndPrim(r)) {
                 return true;
             }
         }else tkerr(iTk,"Lipsa expresie dupa &&");
@@ -844,10 +937,10 @@ bool exprAndPrim(){
 }
 
 
-bool exprAnd(){
+bool exprAnd(Ret *r){
     Token *start=iTk;
-    if(exprEq())
-        if(exprAndPrim())
+    if(exprEq(r))
+        if(exprAndPrim(r))
             return true;
     iTk = start;
     return false;
@@ -855,10 +948,14 @@ bool exprAnd(){
 
 
 
-bool exprOrPrim(){
+bool exprOrPrim(Ret *r){
     if(consume(OR)){
-        if(exprAnd()){
-            if(exprOrPrim()){
+        Ret right;
+        if(exprAnd(&right)){
+            Type tDst;
+            if(!arithTypeTo(&r->type,&right.type,&tDst))tkerr(iTk,"invalid operand type for ||");
+            *r=(Ret){{TB_INT,NULL,-1},false,true};
+            if(exprOrPrim(r)){
                 return true;
             }
         }else tkerr(iTk, "Lipsa expresie dupa ||");
@@ -866,34 +963,43 @@ bool exprOrPrim(){
     return true;
 }
 
-bool exprOr(){
+bool exprOr(Ret *r){
     Token *start=iTk;
-    if(exprAnd())
-        if(exprOrPrim())
+    if(exprAnd(r))
+        if(exprOrPrim(r))
             return true;
     iTk = start;
     return false;
 }
 
-bool exprAssign(){
+bool exprAssign(Ret *r){
     Token *start=iTk;
-    if(exprUnary()) {
+    Ret rDst;
+    if(exprUnary(&rDst)) {
         if (consume(ASSIGN)){
-            if (exprAssign()){
+            if (exprAssign(r)){
+                if(!rDst.lval)tkerr(iTk,"the assign destination must be a left-value");
+                if(rDst.ct)tkerr(iTk,"the assign destination cannot be constant");
+                if(!canBeScalar(&rDst))tkerr(iTk,"the assign destination must be scalar");
+                if(!canBeScalar(r))tkerr(iTk,"the assign source must be scalar");
+                if(!convTo(&r->type,&rDst.type))tkerr(iTk,"the assign source cannot be converted to destination");
+                r->lval=false;
+                r->ct=true;
+
                 return true;
             }else tkerr(iTk,"Lipsa valoare dupa =");
         }
     }
     iTk = start;
-    if(exprOr())
+    if(exprOr(r))
         return  true;
     iTk = start;
     return false;
 }
 
-bool expr(){
+bool expr(Ret *r){
     Token *start=iTk;
-    if(exprAssign())
+    if(exprAssign(r))
         return true;
     iTk = start;
     return false;
@@ -997,7 +1103,6 @@ bool structDef(){
         if (consume(ID)) {
             Token *tkName = consumedTk;
             if (consume(LACC)) {
-
                 Symbol *s=findSymbolInDomain(symTable, tkName->text);
                 if(s)tkerr(iTk,"symbol redefinition: %s",tkName->text);
                 s=addSymbolToDomain(symTable,newSymbol(tkName->text,SK_STRUCT));
@@ -1031,20 +1136,21 @@ bool stmCompound(bool newDomain);
 
 bool stm(){
     Token *start = iTk;
+    Ret rInit,rCond,rStep,rExpr;
     if(stmCompound(true)){
         return true;
     }
     iTk = start;
     if(consume(IF)) {
         if (consume(LPAR)){
-            if (expr()){
+            if (expr(&rCond)){
+                if(!canBeScalar(&rCond))tkerr(iTk,"the if condition must be a scalar value");
                 if (consume(RPAR)){
                     if (stm()) {
                         if (consume(ELSE)) {
                             if (stm()){
                                 return true;
                             }else tkerr(iTk,"Lipseste instructiune dupa else");
-
                         } else return true;
                     }else tkerr(iTk,"Lipsa instructiune/set de instructiuni dupa if");
                 }else tkerr(iTk,"Lipseste \")\" dupa if");
@@ -1054,7 +1160,8 @@ bool stm(){
     iTk = start;
     if(consume(WHILE)){
         if(consume(LPAR)){
-            if(expr()){
+            if(expr(&rCond)){
+                if(!canBeScalar(&rCond))tkerr(iTk,"the while condition must be a scalar value");
                 if(consume(RPAR)){
                     if(stm()){
                         return true;
@@ -1066,11 +1173,12 @@ bool stm(){
     iTk = start;
     if(consume(FOR)){
         if(consume(LPAR)){
-            if(expr() || !expr()){
+            if(expr(&rInit) || !expr(&rInit)){
                 if(consume(SEMICOLON)){
-                    if(expr() || !expr()){
+                    if(expr(&rCond) || !expr(&rCond)){
+                        if(!canBeScalar(&rCond))tkerr(iTk,"the for condition must be a scalar value");
                         if(consume(SEMICOLON)){
-                            if(expr() || !expr()){
+                            if(expr(&rStep) || !expr(&rStep)){
                                 if(consume(RPAR)){
                                     if(stm()){
                                         return true;
@@ -1093,23 +1201,32 @@ bool stm(){
     }
     iTk = start;
     if(consume(RETURN)){
-        if(expr() || !expr()){
+        if(expr(&rExpr)){
+            if(owner->type.tb==TB_VOID)tkerr(iTk,"a void function cannot return a value");
+            if(!canBeScalar(&rExpr))tkerr(iTk,"the return value must be a scalar value");
+            if(!convTo(&rExpr.type,&owner->type))tkerr(iTk,"cannot convert the return expression type to the function return type");
+            if(consume(SEMICOLON)){
+                return true;
+            }else{
+                tkerr(iTk,"Lipseste \";\" dupa return");
+            }
+        }else{
+            if(owner->type.tb!=TB_VOID)tkerr(iTk,"a non-void function must return a value");
             if(consume(SEMICOLON)){
                 return true;
             }else{
                 tkerr(iTk,"Lipseste \";\" dupa return");
             }
         }
-
     }
     iTk = start;
-    if(expr() ){
+    if(expr(&rExpr) ){
         if(consume(SEMICOLON)){
             return true;
         }else tkerr(iTk, "Lipseste \";\" dupa expresie");
     }
 
-    if(!expr()){
+    if(!expr(&rExpr)){
         if(consume(SEMICOLON)){
             return true;
         }
@@ -1148,7 +1265,6 @@ bool fnDef() {
         if (consume(ID)) {
             Token *tkName = consumedTk;
             if (consume(LPAR)) {
-
                 Symbol *fn=findSymbolInDomain(symTable,tkName->text);
                 if(fn)tkerr(iTk,"symbol redefinition: %s",tkName->text);
                 fn=newSymbol(tkName->text,SK_FN);
@@ -1393,7 +1509,7 @@ int allocInGlobalMemory(int nBytes){
 
 int main() {
     int f;
-    if((f = open("testsin.txt", O_RDONLY)) < 0){
+    if((f = open("tip.c", O_RDONLY)) < 0){
         printf("Eroare la deschidere fisier citire");
         exit(EXIT_FAILURE);
     }
